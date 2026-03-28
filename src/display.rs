@@ -2,34 +2,14 @@ use crate::api::{
     Comment, SearchComment, SearchResult, SearchStory, Story, StoryDetail, Tag, User, UserComment,
     UserStats,
 };
+use crate::util::{OutputFormat, extract_domain, print_json, style};
 use colored::{ColoredString, Colorize};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write};
-use std::sync::LazyLock;
+use std::io::{self, Write};
 
 const WRAP_WIDTH: usize = 76;
 const COMMENT_PREVIEW_LINES: usize = 12;
-
-static USE_COLOR: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal());
-
-macro_rules! style {
-    ($text:expr, $method:ident) => {
-        if *USE_COLOR {
-            $text.$method()
-        } else {
-            $text.normal()
-        }
-    };
-    ($text:expr, $method:ident, $method2:ident) => {
-        if *USE_COLOR {
-            $text.$method().$method2()
-        } else {
-            $text.normal()
-        }
-    };
-}
 
 fn score_color(score: i32, text: &str) -> ColoredString {
     match score {
@@ -41,7 +21,7 @@ fn score_color(score: i32, text: &str) -> ColoredString {
 }
 
 fn comment_score_color(score: i32) -> ColoredString {
-    let text = format!("{:+}", score);
+    let text = format!("{score:+}");
     match score {
         n if n >= 10 => style!(text.as_str(), green),
         n if n < 0 => style!(text.as_str(), red),
@@ -57,42 +37,23 @@ fn relative_time(datetime_str: &str) -> String {
                 .map(|naive| naive.and_utc())
         });
 
-    dt.map(|dt| {
-        let d = chrono::Utc::now().signed_duration_since(dt);
-        match (d.num_days(), d.num_hours(), d.num_minutes()) {
-            (days, _, _) if days > 0 => format!("{days}d"),
-            (_, hours, _) if hours > 0 => format!("{hours}h"),
-            (_, _, mins) if mins > 0 => format!("{mins}m"),
-            _ => "now".into(),
-        }
-    })
-    .unwrap_or_else(|_| "?".into())
-}
-
-fn extract_domain(url: &str) -> &str {
-    if url.is_empty() {
-        return "self";
-    }
-    let s = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    s.strip_prefix("www.")
-        .unwrap_or(s)
-        .split(['/', ':', '?'])
-        .next()
-        .unwrap_or("self")
-}
-
-fn print_json<T: Serialize + ?Sized>(data: &T) {
-    if let Ok(json) = serde_json::to_string_pretty(data) {
-        println!("{json}");
-    }
+    dt.map_or_else(
+        |_| "?".into(),
+        |dt| {
+            let d = chrono::Utc::now().signed_duration_since(dt);
+            match (d.num_days(), d.num_hours(), d.num_minutes()) {
+                (days, _, _) if days > 0 => format!("{days}d"),
+                (_, hours, _) if hours > 0 => format!("{hours}h"),
+                (_, _, mins) if mins > 0 => format!("{mins}m"),
+                _ => "now".into(),
+            }
+        },
+    )
 }
 
 #[derive(Default)]
 pub struct DisplayOpts {
-    pub json: bool,
+    pub format: OutputFormat,
     pub full: bool,
 }
 
@@ -105,9 +66,32 @@ pub fn related_stories(items: &[Story], opts: &DisplayOpts) {
 }
 
 fn print_stories(items: &[Story], opts: &DisplayOpts, page: Option<u32>, header: Option<&str>) {
-    if opts.json {
-        return print_json(items);
+    match opts.format {
+        OutputFormat::Json => return print_json(items),
+        OutputFormat::Ids => {
+            for s in items {
+                println!("{}", s.short_id);
+            }
+            return;
+        }
+        OutputFormat::Tsv => {
+            for s in items {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    s.short_id,
+                    s.title,
+                    s.score,
+                    s.comment_count,
+                    s.submitter_user,
+                    s.tags.join(","),
+                    s.url
+                );
+            }
+            return;
+        }
+        OutputFormat::Pretty => {}
     }
+
     if items.is_empty() && header.is_none() {
         return println!("no stories found");
     }
@@ -151,8 +135,13 @@ fn print_stories(items: &[Story], opts: &DisplayOpts, page: Option<u32>, header:
 }
 
 pub fn story_detail(s: &StoryDetail, opts: &DisplayOpts) {
-    if opts.json {
-        return print_json(s);
+    match opts.format {
+        OutputFormat::Json => return print_json(s),
+        OutputFormat::Ids => {
+            println!("{}", s.short_id);
+            return;
+        }
+        _ => {}
     }
 
     let mut out = io::stdout().lock();
@@ -239,7 +228,7 @@ fn print_comment<W: Write>(out: &mut W, c: &Comment, full: bool) {
 }
 
 pub fn user(u: &User, stats: Option<&UserStats>, opts: &DisplayOpts) {
-    if opts.json {
+    if matches!(opts.format, OutputFormat::Json) {
         if let Some(s) = stats {
             #[derive(Serialize)]
             struct Combined<'a> {
@@ -250,6 +239,10 @@ pub fn user(u: &User, stats: Option<&UserStats>, opts: &DisplayOpts) {
             return print_json(&Combined { user: u, stats: s });
         }
         return print_json(u);
+    }
+    if matches!(opts.format, OutputFormat::Ids) {
+        println!("{}", u.username);
+        return;
     }
 
     let mut out = io::stdout().lock();
@@ -315,15 +308,41 @@ pub fn user(u: &User, stats: Option<&UserStats>, opts: &DisplayOpts) {
 }
 
 pub fn tags(items: &[Tag], opts: &DisplayOpts, filter: Option<&str>) {
-    if opts.json {
-        let filtered: Vec<_> = match filter {
-            Some(cat) => items
+    match opts.format {
+        OutputFormat::Json => {
+            let filtered: Vec<_> = items
                 .iter()
-                .filter(|t| t.category.eq_ignore_ascii_case(cat))
-                .collect(),
-            None => items.iter().collect(),
-        };
-        return print_json(&filtered);
+                .filter(|t| filter.is_none_or(|f| t.category.eq_ignore_ascii_case(f)))
+                .collect();
+            return print_json(&filtered);
+        }
+        OutputFormat::Ids => {
+            for t in items {
+                let cat = if t.category.is_empty() {
+                    "other"
+                } else {
+                    &t.category
+                };
+                if filter.is_none_or(|f| cat.eq_ignore_ascii_case(f)) {
+                    println!("{}", t.tag);
+                }
+            }
+            return;
+        }
+        OutputFormat::Tsv => {
+            for t in items {
+                let cat = if t.category.is_empty() {
+                    "other"
+                } else {
+                    &t.category
+                };
+                if filter.is_none_or(|f| cat.eq_ignore_ascii_case(f)) {
+                    println!("{}\t{}\t{}", t.tag, cat, t.description);
+                }
+            }
+            return;
+        }
+        OutputFormat::Pretty => {}
     }
 
     let mut out = io::stdout().lock();
@@ -365,9 +384,21 @@ pub fn tags(items: &[Tag], opts: &DisplayOpts, filter: Option<&str>) {
 }
 
 pub fn user_comments(items: &[UserComment], opts: &DisplayOpts, page: u32) {
-    if opts.json {
-        return print_json(items);
+    match opts.format {
+        OutputFormat::Json => return print_json(items),
+        OutputFormat::Tsv => {
+            for c in items {
+                let preview = c.comment_text.lines().next().unwrap_or("");
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    c.score, c.created_at, c.story_title, preview
+                );
+            }
+            return;
+        }
+        _ => {}
     }
+
     if items.is_empty() {
         return println!("no comments found");
     }
@@ -407,9 +438,32 @@ pub fn search_results(result: &SearchResult, opts: &DisplayOpts, page: u32) {
 }
 
 fn search_stories(items: &[SearchStory], opts: &DisplayOpts, page: u32) {
-    if opts.json {
-        return print_json(items);
+    match opts.format {
+        OutputFormat::Json => return print_json(items),
+        OutputFormat::Ids => {
+            for s in items {
+                println!("{}", s.short_id);
+            }
+            return;
+        }
+        OutputFormat::Tsv => {
+            for s in items {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    s.short_id,
+                    s.title,
+                    s.score,
+                    s.comment_count,
+                    s.submitter_user,
+                    s.tags.join(","),
+                    s.url
+                );
+            }
+            return;
+        }
+        OutputFormat::Pretty => {}
     }
+
     if items.is_empty() {
         return println!("no stories found");
     }
@@ -447,9 +501,27 @@ fn search_stories(items: &[SearchStory], opts: &DisplayOpts, page: u32) {
 }
 
 fn search_comments(items: &[SearchComment], opts: &DisplayOpts, page: u32) {
-    if opts.json {
-        return print_json(items);
+    match opts.format {
+        OutputFormat::Json => return print_json(items),
+        OutputFormat::Ids => {
+            for c in items {
+                println!("{}", c.story_short_id);
+            }
+            return;
+        }
+        OutputFormat::Tsv => {
+            for c in items {
+                let preview = c.comment_text.lines().next().unwrap_or("");
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    c.score, c.commenting_user, c.created_at, c.story_title, preview
+                );
+            }
+            return;
+        }
+        OutputFormat::Pretty => {}
     }
+
     if items.is_empty() {
         return println!("no comments found");
     }

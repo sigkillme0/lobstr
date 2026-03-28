@@ -1,30 +1,11 @@
 use crate::api::StoryDetail;
+use crate::util::{OutputFormat, extract_domain, print_json, style};
 use colored::Colorize;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::sync::LazyLock;
 use std::time::Duration;
 use thiserror::Error;
-
-static USE_COLOR: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal());
-
-macro_rules! style {
-    ($text:expr, $method:ident) => {
-        if *USE_COLOR {
-            $text.$method()
-        } else {
-            $text.normal()
-        }
-    };
-    ($text:expr, $method:ident, $method2:ident) => {
-        if *USE_COLOR {
-            $text.$method().$method2()
-        } else {
-            $text.normal()
-        }
-    };
-}
 
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -44,7 +25,7 @@ pub struct ReadOpts {
     pub width: usize,
     pub full: bool,
     pub raw: bool,
-    pub json: bool,
+    pub format: OutputFormat,
 }
 
 #[derive(Serialize)]
@@ -55,7 +36,6 @@ struct ArticleOutput<'a> {
     content: String,
 }
 
-const MAX_LINES: usize = 200;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -69,16 +49,13 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build http client")
 });
 
-fn extract_domain(url: &str) -> &str {
-    let s = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    s.strip_prefix("www.")
-        .unwrap_or(s)
-        .split(['/', ':', '?'])
-        .next()
-        .unwrap_or("unknown")
+fn default_max_lines() -> usize {
+    if !io::stdout().is_terminal() {
+        return usize::MAX;
+    }
+    crossterm::terminal::size()
+        .map(|(_, rows)| (rows as usize).saturating_sub(10))
+        .unwrap_or(200)
 }
 
 fn is_youtube_url(url: &str) -> Option<String> {
@@ -108,20 +85,19 @@ fn is_youtube_url(url: &str) -> Option<String> {
 }
 
 fn is_unsupported_url(url: &str) -> Option<&'static str> {
-    let lower = url.to_lowercase();
-    if lower.ends_with(".pdf") {
-        return Some("pdf");
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    match std::path::Path::new(&lower)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("pdf") => Some("pdf"),
+        Some("mp4" | "webm" | "mov") => Some("video file"),
+        Some("mp3" | "wav" | "ogg") => Some("audio file"),
+        Some("zip" | "tgz") => Some("archive"),
+        Some("gz") if lower.ends_with(".tar.gz") => Some("archive"),
+        _ => None,
     }
-    if lower.ends_with(".mp4") || lower.ends_with(".webm") || lower.ends_with(".mov") {
-        return Some("video file");
-    }
-    if lower.ends_with(".mp3") || lower.ends_with(".wav") || lower.ends_with(".ogg") {
-        return Some("audio file");
-    }
-    if lower.ends_with(".zip") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        return Some("archive");
-    }
-    None
 }
 
 fn is_github_repo(url: &str) -> bool {
@@ -234,8 +210,6 @@ fn extract_title_from_html(html: &str) -> Option<String> {
 fn extract_with_selectors(html: &str, width: usize) -> Result<String> {
     use scraper::{Html, Selector};
 
-    let doc = Html::parse_document(html);
-
     const SELECTORS: &[&str] = &[
         "article",
         "main article",
@@ -251,6 +225,8 @@ fn extract_with_selectors(html: &str, width: usize) -> Result<String> {
         "#content",
         ".markdown-body",
     ];
+
+    let doc = Html::parse_document(html);
 
     for sel_str in SELECTORS {
         if let Ok(sel) = Selector::parse(sel_str) {
@@ -282,7 +258,7 @@ fn extract_with_selectors(html: &str, width: usize) -> Result<String> {
 fn clean_text(text: &str) -> String {
     let lines: Vec<_> = text
         .lines()
-        .map(|l| l.trim_end())
+        .map(str::trim_end)
         .fold(Vec::new(), |mut acc, line| {
             let is_blank = line.trim().is_empty();
             let last_blank = acc.last().is_some_and(|l: &&str| l.trim().is_empty());
@@ -336,21 +312,14 @@ fn wrap_text(text: &str, width: usize) -> String {
         .join("\n")
 }
 
+#[allow(clippy::too_many_lines, clippy::future_not_send)]
 pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
+    let json = matches!(opts.format, OutputFormat::Json);
     let mut out = io::stdout().lock();
 
     if story.url.is_empty() {
-        if opts.json {
-            let output = ArticleOutput {
-                title: &story.title,
-                url: "",
-                source: "self",
-                content: story.description_plain.clone(),
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+        if json {
+            print_article_json(&story.title, "", "self", &story.description_plain);
             return Ok(());
         }
 
@@ -366,16 +335,12 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
     }
 
     if let Some(content_type) = is_unsupported_url(&story.url) {
-        if opts.json {
-            let output = ArticleOutput {
-                title: &story.title,
-                url: &story.url,
-                source: extract_domain(&story.url),
-                content: format!("[unsupported: {content_type}]"),
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
+        if json {
+            print_article_json(
+                &story.title,
+                &story.url,
+                extract_domain(&story.url),
+                &format!("[unsupported: {content_type}]"),
             );
             return Ok(());
         }
@@ -406,17 +371,8 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
     if let Some(video_id) = is_youtube_url(&story.url) {
         match fetch_youtube_transcript(&video_id).await {
             Ok(transcript) => {
-                if opts.json {
-                    let output = ArticleOutput {
-                        title: &story.title,
-                        url: &story.url,
-                        source: "youtube",
-                        content: transcript.clone(),
-                    };
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&output).unwrap_or_default()
-                    );
+                if json {
+                    print_article_json(&story.title, &story.url, "youtube", &transcript);
                     return Ok(());
                 }
 
@@ -427,7 +383,7 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                if !opts.json {
+                if !json {
                     writeln!(
                         out,
                         "{}",
@@ -435,7 +391,6 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
                     )
                     .ok();
                 }
-                // show url at least
                 print_header(&mut out, &story.title, "youtube", &story.tags);
                 writeln!(
                     out,
@@ -454,17 +409,8 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
     if is_github_repo(&story.url) {
         match fetch_github_readme(&story.url).await {
             Ok(readme) => {
-                if opts.json {
-                    let output = ArticleOutput {
-                        title: &story.title,
-                        url: &story.url,
-                        source: "github",
-                        content: readme.clone(),
-                    };
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&output).unwrap_or_default()
-                    );
+                if json {
+                    print_article_json(&story.title, &story.url, "github", &readme);
                     return Ok(());
                 }
 
@@ -479,7 +425,7 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                if !opts.json {
+                if !json {
                     writeln!(
                         out,
                         "{}",
@@ -487,7 +433,6 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
                     )
                     .ok();
                 }
-                // fall through to normal fetch
             }
         }
     }
@@ -520,17 +465,8 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
 
     let display_title = title.as_deref().unwrap_or(&story.title);
 
-    if opts.json {
-        let output = ArticleOutput {
-            title: display_title,
-            url: &story.url,
-            source,
-            content: content.clone(),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
+    if json {
+        print_article_json(display_title, &story.url, source, &content);
         return Ok(());
     }
 
@@ -546,6 +482,15 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
     print_footer(&mut out, story);
 
     Ok(())
+}
+
+fn print_article_json(title: &str, url: &str, source: &str, content: &str) {
+    print_json(&ArticleOutput {
+        title,
+        url,
+        source,
+        content: content.to_string(),
+    });
 }
 
 fn print_header<W: Write>(out: &mut W, title: &str, source: &str, tags: &[String]) {
@@ -566,7 +511,11 @@ fn print_header<W: Write>(out: &mut W, title: &str, source: &str, tags: &[String
 
 fn print_content<W: Write>(out: &mut W, content: &str, full: bool) {
     let lines: Vec<_> = content.lines().collect();
-    let max = if full { usize::MAX } else { MAX_LINES };
+    let max = if full {
+        usize::MAX
+    } else {
+        default_max_lines()
+    };
 
     for line in lines.iter().take(max) {
         writeln!(out, "{line}").ok();

@@ -1,6 +1,8 @@
 mod api;
+mod config;
 mod display;
 mod reader;
+mod util;
 
 use api::{CommentSort, ListOpts, SearchOpts, SearchOrder, SearchWhat, TagMode};
 use chrono::{DateTime, FixedOffset, Local, TimeDelta};
@@ -8,6 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use display::DisplayOpts;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::process::ExitCode;
+use util::OutputFormat;
 
 #[derive(Parser)]
 #[command(name = "lobstr", version, about = "terminal client for lobste.rs")]
@@ -15,7 +18,11 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 
-    /// output as json
+    /// output format (pretty, json, tsv, ids)
+    #[arg(long, short = 'F', global = true, default_value = "pretty")]
+    format: OutputFormat,
+
+    /// output as json (shorthand for --format json)
     #[arg(long, global = true)]
     json: bool,
 
@@ -24,15 +31,25 @@ struct Cli {
     strict: bool,
 }
 
+impl Cli {
+    const fn format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.format
+        }
+    }
+}
+
 #[derive(Args, Clone)]
 struct ListArgs {
-    /// max stories to show
-    #[arg(short, long, default_value = "25")]
-    limit: NonZeroUsize,
+    /// max stories to show [default: 25]
+    #[arg(short, long)]
+    limit: Option<NonZeroUsize>,
 
-    /// page number
-    #[arg(short, long, default_value = "1")]
-    page: NonZeroU32,
+    /// page number [default: 1]
+    #[arg(short, long)]
+    page: Option<NonZeroU32>,
 
     /// minimum score filter
     #[arg(short = 's', long)]
@@ -82,9 +99,10 @@ fn parse_date(s: &str) -> Result<DateTime<FixedOffset>, String> {
 
 impl From<&ListArgs> for ListOpts {
     fn from(a: &ListArgs) -> Self {
+        let default_limit = config::CONFIG.default_limit.unwrap_or(25);
         Self {
-            limit: a.limit.get(),
-            page: a.page.get(),
+            limit: a.limit.map_or(default_limit, NonZeroUsize::get),
+            page: a.page.map_or(1, NonZeroU32::get),
             min_score: a.min_score,
             after: a.after,
             before: a.before,
@@ -132,12 +150,12 @@ enum Cmd {
         /// order by: relevance, newest, score
         #[arg(short, long, default_value = "relevance")]
         order: SearchOrder,
-        /// max results to show
-        #[arg(short, long, default_value = "25")]
-        limit: NonZeroUsize,
-        /// page number
-        #[arg(short, long, default_value = "1")]
-        page: NonZeroU32,
+        /// max results to show [default: 25]
+        #[arg(short, long)]
+        limit: Option<NonZeroUsize>,
+        /// page number [default: 1]
+        #[arg(short, long)]
+        page: Option<NonZeroU32>,
     },
     /// view story with comments
     View {
@@ -227,29 +245,31 @@ where
     items.into()
 }
 
+#[allow(clippy::too_many_lines, clippy::future_not_send)]
 async fn run(cli: &Cli) -> RunResult {
+    let format = cli.format();
     let opts = DisplayOpts {
-        json: cli.json,
+        format,
         full: false,
     };
 
     match &cli.cmd {
         Cmd::Hot { args } => {
-            let p = args.page.get();
+            let p = args.page.map_or(1, NonZeroU32::get);
             fetch_and_show(api::hottest(&args.into()).await, |v| {
-                display::stories(v, &opts, p)
+                display::stories(v, &opts, p);
             })
         }
         Cmd::New { args } => {
-            let p = args.page.get();
+            let p = args.page.map_or(1, NonZeroU32::get);
             fetch_and_show(api::newest(&args.into()).await, |v| {
-                display::stories(v, &opts, p)
+                display::stories(v, &opts, p);
             })
         }
         Cmd::Active { args } => {
-            let p = args.page.get();
+            let p = args.page.map_or(1, NonZeroU32::get);
             fetch_and_show(api::active(&args.into()).await, |v| {
-                display::stories(v, &opts, p)
+                display::stories(v, &opts, p);
             })
         }
         Cmd::Tag {
@@ -259,10 +279,12 @@ async fn run(cli: &Cli) -> RunResult {
             args,
         } => {
             let mode = if *any { TagMode::Any } else { TagMode::All };
-            let p = args.page.get();
+            let p = args.page.map_or(1, NonZeroU32::get);
             fetch_and_show(
                 api::by_tag(name, &args.into(), mode, exclude.as_deref()).await,
-                |v| display::stories(v, &opts, p),
+                |v| {
+                    display::stories(v, &opts, p);
+                },
             )
         }
         Cmd::Search {
@@ -272,17 +294,18 @@ async fn run(cli: &Cli) -> RunResult {
             limit,
             page,
         } => {
+            let default_limit = config::CONFIG.default_limit.unwrap_or(25);
             let search_opts = SearchOpts {
                 query: query.clone(),
                 what: *what,
                 order: *order,
-                page: page.get(),
-                limit: limit.get(),
+                page: page.map_or(1, NonZeroU32::get),
+                limit: limit.map_or(default_limit, NonZeroUsize::get),
             };
             match api::search(&search_opts).await {
                 Ok(result) if result.is_empty() => RunResult::Empty,
                 Ok(result) => {
-                    display::search_results(&result, &opts, page.get());
+                    display::search_results(&result, &opts, page.map_or(1, NonZeroU32::get));
                     RunResult::Ok
                 }
                 Err(e) => RunResult::Err(e),
@@ -300,7 +323,7 @@ async fn run(cli: &Cli) -> RunResult {
                 display::story_detail(
                     &story,
                     &DisplayOpts {
-                        json: cli.json,
+                        format,
                         full: *full,
                     },
                 );
@@ -316,28 +339,32 @@ async fn run(cli: &Cli) -> RunResult {
             Err(e) => RunResult::Err(e),
         },
         Cmd::User { action } => match action {
-            UserAction::Info { name } => match api::user(name).await {
-                Ok(user) => {
-                    display::user(&user, api::user_stats(name).await.ok().as_ref(), &opts);
-                    RunResult::Ok
+            UserAction::Info { name } => {
+                let (user_result, stats_result) =
+                    tokio::join!(api::user(name), api::user_stats(name));
+                match user_result {
+                    Ok(user) => {
+                        display::user(&user, stats_result.ok().as_ref(), &opts);
+                        RunResult::Ok
+                    }
+                    Err(e) => RunResult::Err(e),
                 }
-                Err(e) => RunResult::Err(e),
-            },
+            }
             UserAction::Stories { name, args } => {
-                let p = args.page.get();
+                let p = args.page.map_or(1, NonZeroU32::get);
                 fetch_and_show(api::user_stories(name, &args.into()).await, |v| {
-                    display::stories(v, &opts, p)
+                    display::stories(v, &opts, p);
                 })
             }
             UserAction::Comments { name, args } => {
-                let p = args.page.get();
+                let p = args.page.map_or(1, NonZeroU32::get);
                 fetch_and_show(api::user_comments(name, &args.into()).await, |v| {
-                    display::user_comments(v, &opts, p)
+                    display::user_comments(v, &opts, p);
                 })
             }
         },
         Cmd::Tags { category } => fetch_and_show(api::tags().await, |v| {
-            display::tags(v, &opts, category.as_deref())
+            display::tags(v, &opts, category.as_deref());
         }),
         Cmd::Open {
             id,
@@ -350,13 +377,13 @@ async fn run(cli: &Cli) -> RunResult {
                     width: *width,
                     full: *full,
                     raw: *raw,
-                    json: cli.json,
+                    format,
                 };
                 match reader::read_article(&story, &read_opts).await {
                     Ok(()) => RunResult::Ok,
                     Err(e) => {
                         eprintln!("failed to read article: {e}");
-                        RunResult::Ok // still show story info at minimum
+                        RunResult::Ok
                     }
                 }
             }
@@ -369,9 +396,8 @@ async fn run(cli: &Cli) -> RunResult {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli).await {
-        RunResult::Ok => ExitCode::SUCCESS,
         RunResult::Empty if cli.strict => ExitCode::FAILURE,
-        RunResult::Empty => ExitCode::SUCCESS,
+        RunResult::Ok | RunResult::Empty => ExitCode::SUCCESS,
         RunResult::Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
