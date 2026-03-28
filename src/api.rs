@@ -124,15 +124,22 @@ pub enum Error {
     NotFound(String),
     #[error("rate limited, try again later")]
     RateLimited,
-    #[error("failed to parse html")]
-    ParseHtml,
+    #[error("parse failed: {0}")]
+    ParseHtml(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 async fn get<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     let text = get_text(path).await?;
-    serde_json::from_str(&text).map_err(|_| Error::ParseHtml)
+    serde_json::from_str(&text).map_err(|e| {
+        let preview: String = text.chars().take(200).collect();
+        Error::ParseHtml(format!("{path}: {e} (body: {preview}...)"))
+    })
+}
+
+fn sel(s: &str) -> Result<Selector> {
+    Selector::parse(s).map_err(|_| Error::ParseHtml(format!("invalid selector: {s}")))
 }
 
 async fn get_text(path: &str) -> Result<String> {
@@ -160,7 +167,6 @@ async fn get_text(path: &str) -> Result<String> {
             }
             Err(e) if e.is_timeout() || e.is_connect() => {
                 last_err = Some(Error::Http(e));
-                continue;
             }
             Err(e) => return Err(Error::Http(e)),
         }
@@ -200,6 +206,7 @@ pub struct StoryDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Comment {
     pub created_at: String,
     pub score: i32,
@@ -213,8 +220,7 @@ pub struct Comment {
 }
 
 impl Comment {
-    #[inline]
-    pub fn is_visible(&self) -> bool {
+    pub const fn is_visible(&self) -> bool {
         !self.is_deleted && !self.is_moderated
     }
 }
@@ -293,6 +299,7 @@ where
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct User {
     pub username: String,
     pub created_at: String,
@@ -316,6 +323,7 @@ pub struct UserStats {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Tag {
     pub tag: String,
     pub description: String,
@@ -391,7 +399,7 @@ const MAX_PAGES_FETCH: u32 = 10;
 
 async fn fetch_stories<F>(opts: &ListOpts, make_path: F) -> Result<Vec<Story>>
 where
-    F: Fn(u32) -> String,
+    F: Fn(u32) -> String + Send + Sync,
 {
     if opts.after.is_some() || opts.before.is_some() {
         return fetch_pages_filtered(opts, &make_path).await;
@@ -424,7 +432,7 @@ pub async fn active(opts: &ListOpts) -> Result<Vec<Story>> {
 
 async fn fetch_pages_filtered(
     opts: &ListOpts,
-    make_path: &impl Fn(u32) -> String,
+    make_path: &(impl Fn(u32) -> String + Sync),
 ) -> Result<Vec<Story>> {
     let mut all = Vec::new();
     let mut page = opts.page;
@@ -517,12 +525,20 @@ pub async fn user_stats(name: &str) -> Result<UserStats> {
         return Err(Error::NotFound(format!("invalid username: {name}")));
     }
 
-    let html = get_text(&format!("/~{name}")).await?;
+    let profile_path = format!("/~{name}");
+    let karma_opts = ListOpts {
+        limit: 100,
+        ..Default::default()
+    };
+    let (html_result, karma_result) =
+        tokio::join!(get_text(&profile_path), user_stories(name, &karma_opts));
+
+    let html = html_result?;
     let doc = Html::parse_document(&html);
 
-    let stories_sel = Selector::parse(r#"a[href$="/stories"]"#).map_err(|_| Error::ParseHtml)?;
-    let comments_sel = Selector::parse(r#"a[href$="/threads"]"#).map_err(|_| Error::ParseHtml)?;
-    let tag_sel = Selector::parse(r#"a.tag"#).map_err(|_| Error::ParseHtml)?;
+    let stories_sel = sel(r#"a[href$="/stories"]"#)?;
+    let comments_sel = sel(r#"a[href$="/threads"]"#)?;
+    let tag_sel = sel("a.tag")?;
 
     let stories_count = doc
         .select(&stories_sel)
@@ -539,16 +555,9 @@ pub async fn user_stats(name: &str) -> Result<UserStats> {
         .next()
         .map(|el| el.text().collect::<String>().trim().to_string());
 
-    let story_karma = user_stories(
-        name,
-        &ListOpts {
-            limit: 100,
-            ..Default::default()
-        },
-    )
-    .await
-    .ok()
-    .map(|stories| stories.iter().map(|s| s.score).sum());
+    let story_karma = karma_result
+        .ok()
+        .map(|stories| stories.iter().map(|s| s.score).sum());
 
     Ok(UserStats {
         stories_count,
@@ -571,21 +580,24 @@ pub async fn related(story: &StoryDetail, limit: usize) -> Result<Vec<Story>> {
         return Ok(Vec::new());
     }
 
+    let handles: Vec<_> = story
+        .tags
+        .iter()
+        .map(|tag| {
+            let path = format!("/t/{tag}.json");
+            tokio::spawn(async move { get::<Vec<Story>>(&path).await })
+        })
+        .collect();
+
     let mut seen = HashSet::new();
+    seen.insert(story.short_id.clone());
     let mut related = Vec::new();
 
-    for tag in &story.tags {
-        let stories: Vec<Story> = match get(&format!("/t/{tag}.json")).await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        for s in stories {
-            if s.short_id != story.short_id && seen.insert(s.short_id.clone()) {
-                related.push(s);
-                if related.len() >= limit {
-                    related.sort_unstable_by(|a, b| b.score.cmp(&a.score));
-                    return Ok(related);
+    for handle in handles {
+        if let Ok(Ok(stories)) = handle.await {
+            for s in stories {
+                if seen.insert(s.short_id.clone()) {
+                    related.push(s);
                 }
             }
         }
@@ -693,12 +705,11 @@ pub async fn user_comments(name: &str, opts: &ListOpts) -> Result<Vec<UserCommen
     let html = get_text(&path).await?;
     let doc = Html::parse_document(&html);
 
-    let comment_sel = Selector::parse("div.comment").map_err(|_| Error::ParseHtml)?;
-    let score_sel = Selector::parse("a.upvoter").map_err(|_| Error::ParseHtml)?;
-    let time_sel = Selector::parse("time").map_err(|_| Error::ParseHtml)?;
-    let story_link_sel =
-        Selector::parse("div.byline a[href^='/s/']").map_err(|_| Error::ParseHtml)?;
-    let body_sel = Selector::parse("div.comment_text").map_err(|_| Error::ParseHtml)?;
+    let comment_sel = sel("div.comment")?;
+    let score_sel = sel("a.upvoter")?;
+    let time_sel = sel("time")?;
+    let story_link_sel = sel("div.byline a[href^='/s/']")?;
+    let body_sel = sel("div.comment_text")?;
 
     let mut comments = Vec::new();
 
@@ -753,15 +764,7 @@ pub async fn user_comments(name: &str, opts: &ListOpts) -> Result<Vec<UserCommen
 }
 
 fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            b' ' => "+".to_string(),
-            _ => format!("%{:02X}", b),
-        })
-        .collect()
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
 pub async fn search(opts: &SearchOpts) -> Result<SearchResult> {
@@ -788,15 +791,15 @@ async fn search_stories(opts: &SearchOpts) -> Result<Vec<SearchStory>> {
     let html = get_text(&path).await?;
     let doc = Html::parse_document(&html);
 
-    let story_sel = Selector::parse("li.story").map_err(|_| Error::ParseHtml)?;
-    let score_sel = Selector::parse("a.upvoter").map_err(|_| Error::ParseHtml)?;
-    let title_sel = Selector::parse("span.link a.u-url").map_err(|_| Error::ParseHtml)?;
-    let tag_sel = Selector::parse("span.tags a.tag").map_err(|_| Error::ParseHtml)?;
-    let domain_sel = Selector::parse("a.domain").map_err(|_| Error::ParseHtml)?;
-    let user_sel = Selector::parse("div.byline a.u-author").map_err(|_| Error::ParseHtml)?;
-    let time_sel = Selector::parse("div.byline time").map_err(|_| Error::ParseHtml)?;
-    let comments_sel = Selector::parse("span.comments_label a").map_err(|_| Error::ParseHtml)?;
-    let desc_sel = Selector::parse("a.description_present").map_err(|_| Error::ParseHtml)?;
+    let story_sel = sel("li.story")?;
+    let score_sel = sel("a.upvoter")?;
+    let title_sel = sel("span.link a.u-url")?;
+    let tag_sel = sel("span.tags a.tag")?;
+    let domain_sel = sel("a.domain")?;
+    let user_sel = sel("div.byline a.u-author")?;
+    let time_sel = sel("div.byline time")?;
+    let comments_sel = sel("span.comments_label a")?;
+    let desc_sel = sel("a.description_present")?;
 
     let mut stories = Vec::new();
 
@@ -811,11 +814,9 @@ async fn search_stories(opts: &SearchOpts) -> Result<Vec<SearchStory>> {
             continue;
         }
 
-        let score = el
-            .select(&score_sel)
-            .next()
-            .map(|s| s.text().collect::<String>().trim().parse().unwrap_or(0))
-            .unwrap_or(0);
+        let score = el.select(&score_sel).next().map_or(0, |s| {
+            s.text().collect::<String>().trim().parse().unwrap_or(0)
+        });
 
         let (title, url) = el
             .select(&title_sel)
@@ -837,11 +838,10 @@ async fn search_stories(opts: &SearchOpts) -> Result<Vec<SearchStory>> {
             .map(|t| t.text().collect::<String>().trim().to_string())
             .collect();
 
-        let domain = el
-            .select(&domain_sel)
-            .next()
-            .map(|d| d.text().collect::<String>().trim().to_string())
-            .unwrap_or_else(|| "self".to_string());
+        let domain = el.select(&domain_sel).next().map_or_else(
+            || "self".to_string(),
+            |d| d.text().collect::<String>().trim().to_string(),
+        );
 
         let submitter_user = el
             .select(&user_sel)
@@ -901,13 +901,12 @@ async fn search_comments(opts: &SearchOpts) -> Result<Vec<SearchComment>> {
     let html = get_text(&path).await?;
     let doc = Html::parse_document(&html);
 
-    let comment_sel = Selector::parse("div.comment").map_err(|_| Error::ParseHtml)?;
-    let score_sel = Selector::parse("a.upvoter").map_err(|_| Error::ParseHtml)?;
-    let user_sel = Selector::parse("div.byline a[href^='/~']:not([aria-hidden])")
-        .map_err(|_| Error::ParseHtml)?;
-    let time_sel = Selector::parse("div.byline time").map_err(|_| Error::ParseHtml)?;
-    let story_sel = Selector::parse("div.byline a[href^='/s/']").map_err(|_| Error::ParseHtml)?;
-    let text_sel = Selector::parse("div.comment_text").map_err(|_| Error::ParseHtml)?;
+    let comment_sel = sel("div.comment")?;
+    let score_sel = sel("a.upvoter")?;
+    let user_sel = sel("div.byline a[href^='/~']:not([aria-hidden])")?;
+    let time_sel = sel("div.byline time")?;
+    let story_sel = sel("div.byline a[href^='/s/']")?;
+    let text_sel = sel("div.comment_text")?;
 
     let mut comments = Vec::new();
 
