@@ -1,118 +1,101 @@
 # lobstr
 
-a no-nonsense terminal tool to interact with [lobste.rs](https://lobste.rs/).
+browse [lobste.rs](https://lobste.rs/) from your terminal.
 
-## build
+## install
 
 ```sh
 cargo build --release
+# binary is at ./target/release/lobstr
 ```
 
-binary lands in `./target/release/lobstr`
+## what you can do
 
-## usage
-
-```
-lobstr <COMMAND>
-
-Commands:
-  hot     show hottest stories
-  new     show newest stories
-  tag     show stories by tag
-  active  show active/recent discussions
-  view    view a specific story with comments
-  open    read article content in terminal
-  user    show user profile
-  tags    list all available tags
-  help    Print this message or the help of the given subcommand(s)
-```
-
-## examples
-
-### browse hot stories
+browse the front page, newest stories, or active threads:
 
 ```sh
 lobstr hot
-lobstr hot -l 10  # limit to 10
-```
-
-### browse newest
-
-```sh
 lobstr new
-lobstr new -l 15 -p 2  # page 2, 15 items
-```
-
-### filter by tag
-
-```sh
-lobstr tag rust
-lobstr tag linux -l 20
-lobstr tag rust,web --any        # match ANY tag (OR)
-lobstr tag rust --exclude satire # exclude stories with tag
-```
-
-### view story with comments
-
-```sh
-lobstr view ngwloq  # use short_id shown in brackets
-lobstr view ngwloq --full        # show full comments
-lobstr view ngwloq --sort score  # sort comments by score
-```
-
-### read article in terminal
-
-```sh
-lobstr open ngwloq               # read article content
-lobstr open ngwloq --full        # show full content (no truncation)
-lobstr open ngwloq -w 60         # wrap at 60 columns
-lobstr open ngwloq --raw         # raw text, no formatting
-lobstr open ngwloq --json        # output as json
-```
-
-supported sources:
-- **youtube videos** - fetches and displays video transcripts
-- **github repos** - fetches README with markdown rendering
-- **blog posts / articles** - extracts main content via readability
-- **self posts** - shows description
-
-gracefully handles unsupported content:
-- pdfs (shows url)
-- audio/video files (shows url)
-
-### view user profile
-
-```sh
-lobstr user info pushcx          # show profile
-lobstr user stories pushcx       # show user's stories
-lobstr user comments pushcx      # show user's comments
-```
-
-### list all tags
-
-```sh
-lobstr tags
-lobstr tags -c programming  # filter by category
-```
-
-### active discussions
-
-```sh
 lobstr active
 ```
 
-## global options
+filter by tag, combine tags, exclude what you don't want:
 
 ```sh
---json    # output as json (works with all commands)
---strict  # exit code 1 if no results (for scripting)
+lobstr tag rust
+lobstr tag rust,web --any
+lobstr tag linux --exclude satire
 ```
 
-## dependencies
+search stories or comments:
 
-- [llm_readability](https://crates.io/crates/llm_readability) - article extraction
-- [yt-transcript-rs](https://crates.io/crates/yt-transcript-rs) - youtube transcripts
-- [termimad](https://crates.io/crates/termimad) - terminal markdown rendering
+```sh
+lobstr search "memory safety"
+lobstr search sqlite -w comments -o newest
+```
+
+see a story and its comments — the short id is the thing in brackets next to each title:
+
+```sh
+lobstr view ngwloq
+lobstr view ngwloq --full --sort score
+```
+
+read the actual article without leaving your terminal. works with blog posts, github repos (shows the README), and youtube videos (shows the transcript):
+
+```sh
+lobstr open ngwloq
+lobstr open ngwloq --full -w 60
+```
+
+look up users:
+
+```sh
+lobstr user info pushcx
+lobstr user stories pushcx
+lobstr user comments pushcx
+```
+
+every listing command takes `-l` for limit, `-p` for page, `-s` for minimum score, and `--after`/`--before` for date ranges:
+
+```sh
+lobstr hot -l 10 -s 20
+lobstr new --after 1d
+lobstr tag rust --after 1w --before 3d
+lobstr hot --after 2024-01-01 --before 2024-02-01
+```
+
+dates can be relative (`1h`, `1d`, `1w`, `1m`, `1y`) or absolute (`2024-01-15`).
+
+## output formats
+
+everything defaults to colored terminal output. pass `--json` for json, or `-F` for other formats:
+
+```sh
+lobstr hot --json
+lobstr hot -F tsv
+lobstr hot -F ids
+```
+
+the `ids` format is one short id per line, which makes piping easy:
+
+```sh
+lobstr hot -F ids | xargs -I{} lobstr open {} --json > articles.json
+lobstr hot -F tsv | awk -F'\t' '$3 >= 20 {print $2}'
+```
+
+`--strict` makes the exit code 1 when there are no results, which is handy for scripts.
+
+## config
+
+you can drop a config file at `~/.config/lobstr/config.toml` if you want different defaults:
+
+```toml
+default_limit = 15
+color = false
+```
+
+cli flags always win over config. color respects `NO_COLOR` by default.
 
 ## license
 
