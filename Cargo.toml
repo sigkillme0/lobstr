@@ -21,6 +21,9 @@ url = "2"
 llm_readability = "0.0.11"
 yt-transcript-rs = "0.1.8"
 termimad = "0.34.1"
+dirs = "6"
+toml = "0.8"
+crossterm = "0.29"
 
 [profile.release]
 lto = true
