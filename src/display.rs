@@ -54,7 +54,6 @@ fn relative_time(datetime_str: &str) -> String {
 #[derive(Default)]
 pub struct DisplayOpts {
     pub format: OutputFormat,
-    pub full: bool,
 }
 
 pub fn stories(items: &[Story], opts: &DisplayOpts, page: u32) {
@@ -134,7 +133,7 @@ fn print_stories(items: &[Story], opts: &DisplayOpts, page: Option<u32>, header:
     }
 }
 
-pub fn story_detail(s: &StoryDetail, opts: &DisplayOpts) {
+pub fn story_detail(s: &StoryDetail, opts: &DisplayOpts, full: bool) {
     match opts.format {
         OutputFormat::Json => return print_json(s),
         OutputFormat::Ids => {
@@ -190,7 +189,7 @@ pub fn story_detail(s: &StoryDetail, opts: &DisplayOpts) {
     writeln!(out).ok();
 
     for c in visible {
-        print_comment(&mut out, c, opts.full);
+        print_comment(&mut out, c, full);
     }
 }
 

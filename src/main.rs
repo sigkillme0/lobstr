@@ -250,10 +250,7 @@ where
 #[allow(clippy::too_many_lines, clippy::future_not_send)]
 async fn run(cli: &Cli) -> RunResult {
     let format = cli.format();
-    let opts = DisplayOpts {
-        format,
-        full: false,
-    };
+    let opts = DisplayOpts { format };
 
     match &cli.cmd {
         Cmd::Hot { args } => {
@@ -324,13 +321,7 @@ async fn run(cli: &Cli) -> RunResult {
         } => match api::story(id).await {
             Ok(mut story) => {
                 api::sort_comments(&mut story.comments, *sort);
-                display::story_detail(
-                    &story,
-                    &DisplayOpts {
-                        format,
-                        full: *full,
-                    },
-                );
+                display::story_detail(&story, &opts, *full);
                 if *related {
                     if let Ok(rel) = api::related(&story, related_limit.get()).await {
                         if !rel.is_empty() {
@@ -385,10 +376,9 @@ async fn run(cli: &Cli) -> RunResult {
                 };
                 match reader::read_article(&story, &read_opts).await {
                     Ok(()) => RunResult::Ok,
-                    Err(e) => {
-                        eprintln!("failed to read article: {e}");
-                        RunResult::Ok
-                    }
+                    Err(e) => RunResult::Err(api::Error::ParseHtml(format!(
+                        "failed to read article: {e}"
+                    ))),
                 }
             }
             Err(e) => RunResult::Err(e),
@@ -398,6 +388,13 @@ async fn run(cli: &Cli) -> RunResult {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Reset SIGPIPE to default so broken pipes kill the process cleanly
+    // instead of causing write errors throughout the display code
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     match run(&cli).await {
         RunResult::Empty if cli.strict => ExitCode::FAILURE,
