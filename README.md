@@ -95,7 +95,7 @@ default_limit = 15
 color = false
 ```
 
-cli flags always win over config. color respects `NO_COLOR` by default.
+cli flags always win over config. color respects `NO_COLOR` by default. if your config file has a syntax error or invalid values, lobstr will warn you and fall back to defaults.
 
 ## license
 
