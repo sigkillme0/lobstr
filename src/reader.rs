@@ -130,25 +130,21 @@ async fn fetch_github_readme(url: &str) -> Result<String> {
     }
 
     let (owner, repo) = (parts[0], parts[1]);
+    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/readme");
 
-    for readme in [
-        "README.md",
-        "readme.md",
-        "README",
-        "README.rst",
-        "README.txt",
-    ] {
-        let raw_url = format!("https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{readme}");
-        if let Ok(resp) = CLIENT.get(&raw_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    return Ok(text);
-                }
-            }
-        }
+    let resp = CLIENT
+        .get(&api_url)
+        .header("Accept", "application/vnd.github.raw+json")
+        .header("User-Agent", "lobstr")
+        .send()
+        .await
+        .map_err(ReadError::Fetch)?;
+
+    if !resp.status().is_success() {
+        return Err(ReadError::Other("could not find readme".into()));
     }
 
-    Err(ReadError::Other("could not find readme".into()))
+    resp.text().await.map_err(ReadError::Fetch)
 }
 
 async fn fetch_youtube_transcript(video_id: &str) -> Result<String> {
@@ -165,7 +161,7 @@ async fn fetch_youtube_transcript(video_id: &str) -> Result<String> {
     Ok(transcript.text())
 }
 
-fn extract_with_llm_readability(html: &str, url_str: &str) -> Result<(Option<String>, String)> {
+fn extract_with_llm_readability(html: &str, url_str: &str) -> Result<String> {
     let url = url::Url::parse(url_str).map_err(|_| ReadError::Extract)?;
     match llm_readability::extractor::extract(&mut html.as_bytes(), &url) {
         Ok(product) => {
@@ -177,98 +173,11 @@ fn extract_with_llm_readability(html: &str, url_str: &str) -> Result<(Option<Str
             if content.trim().is_empty() {
                 Err(ReadError::Extract)
             } else {
-                let title = extract_title_from_html(html);
-                Ok((title, content))
+                Ok(content)
             }
         }
         Err(_) => Err(ReadError::Extract),
     }
-}
-
-fn extract_title_from_html(html: &str) -> Option<String> {
-    use scraper::{Html, Selector};
-    let doc = Html::parse_document(html);
-    if let Ok(sel) = Selector::parse("title") {
-        if let Some(el) = doc.select(&sel).next() {
-            let title = el.text().collect::<String>().trim().to_string();
-            if !title.is_empty() {
-                return Some(title);
-            }
-        }
-    }
-    if let Ok(sel) = Selector::parse("h1") {
-        if let Some(el) = doc.select(&sel).next() {
-            let title = el.text().collect::<String>().trim().to_string();
-            if !title.is_empty() {
-                return Some(title);
-            }
-        }
-    }
-    None
-}
-
-fn extract_with_selectors(html: &str, width: usize) -> Result<String> {
-    use scraper::{Html, Selector};
-
-    const SELECTORS: &[&str] = &[
-        "article",
-        "main article",
-        "[role='main']",
-        ".post-content",
-        ".article-content",
-        ".entry-content",
-        ".content",
-        ".post-body",
-        ".article-body",
-        ".story-body",
-        "main",
-        "#content",
-        ".markdown-body",
-    ];
-
-    let doc = Html::parse_document(html);
-
-    for sel_str in SELECTORS {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = doc.select(&sel).next() {
-                let inner = el.html();
-                let text = html2text::from_read(inner.as_bytes(), width).unwrap_or_default();
-                let cleaned = clean_text(&text);
-                if cleaned.split_whitespace().count() > 50 {
-                    return Ok(cleaned);
-                }
-            }
-        }
-    }
-
-    if let Ok(sel) = Selector::parse("body") {
-        if let Some(el) = doc.select(&sel).next() {
-            let inner = el.html();
-            let text = html2text::from_read(inner.as_bytes(), width).unwrap_or_default();
-            let cleaned = clean_text(&text);
-            if cleaned.split_whitespace().count() > 30 {
-                return Ok(cleaned);
-            }
-        }
-    }
-
-    Err(ReadError::Extract)
-}
-
-fn clean_text(text: &str) -> String {
-    let lines: Vec<_> = text
-        .lines()
-        .map(str::trim_end)
-        .fold(Vec::new(), |mut acc, line| {
-            let is_blank = line.trim().is_empty();
-            let last_blank = acc.last().is_some_and(|l: &&str| l.trim().is_empty());
-            if !(is_blank && last_blank) {
-                acc.push(line);
-            }
-            acc
-        });
-
-    lines.join("\n").trim().to_string()
 }
 
 fn render_markdown(text: &str, width: usize) -> String {
@@ -312,133 +221,52 @@ fn wrap_text(text: &str, width: usize) -> String {
         .join("\n")
 }
 
-#[allow(clippy::too_many_lines, clippy::future_not_send)]
 pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
-    let json = matches!(opts.format, OutputFormat::Json);
-    let mut out = io::stdout().lock();
-
+    // Self-posts: always succeed
     if story.url.is_empty() {
-        if json {
-            print_article_json(&story.title, "", "self", &story.description_plain);
-            return Ok(());
-        }
-
-        print_header(&mut out, &story.title, "self post", &story.tags);
-        if story.description_plain.is_empty() {
-            writeln!(out, "{}", style!("(no content - discussion post)", dimmed)).ok();
-        } else {
-            let text = wrap_text(&story.description_plain, opts.width);
-            writeln!(out, "{text}").ok();
-        }
-        print_footer(&mut out, story);
-        return Ok(());
+        return render_self_post(story, opts);
     }
 
+    // Check for unsupported file types before fetching
     if let Some(content_type) = is_unsupported_url(&story.url) {
-        if json {
-            print_article_json(
-                &story.title,
-                &story.url,
-                extract_domain(&story.url),
-                &format!("[unsupported: {content_type}]"),
-            );
-            return Ok(());
-        }
-
-        print_header(
-            &mut out,
-            &story.title,
-            extract_domain(&story.url),
-            &story.tags,
-        );
-        writeln!(
-            out,
-            "{}",
-            style!(
-                format!("unsupported content type: {content_type}").as_str(),
-                red
-            )
-        )
-        .ok();
-        writeln!(out).ok();
-        writeln!(out, "url: {}", style!(story.url.as_str(), blue)).ok();
-        print_footer(&mut out, story);
-        return Err(ReadError::UnsupportedType(content_type.to_string()));
+        return render_unsupported(story, content_type, opts);
     }
 
-    let source = extract_domain(&story.url);
+    // Fetch content based on URL type
+    let (source, content) = fetch_content(story, opts).await?;
+    render_article(story, &source, &content, opts);
+    Ok(())
+}
 
+async fn fetch_content(story: &StoryDetail, opts: &ReadOpts) -> Result<(String, String)> {
+    // YouTube: fetch transcript
     if let Some(video_id) = is_youtube_url(&story.url) {
-        match fetch_youtube_transcript(&video_id).await {
-            Ok(transcript) => {
-                if json {
-                    print_article_json(&story.title, &story.url, "youtube", &transcript);
-                    return Ok(());
-                }
-
-                print_header(&mut out, &story.title, "youtube [transcript]", &story.tags);
-                let content = wrap_text(&transcript, opts.width);
-                print_content(&mut out, &content, opts.full);
-                print_footer(&mut out, story);
-                return Ok(());
-            }
-            Err(e) => {
-                if !json {
-                    writeln!(
-                        out,
-                        "{}",
-                        style!(format!("transcript unavailable: {e}").as_str(), yellow)
-                    )
-                    .ok();
-                }
-                print_header(&mut out, &story.title, "youtube", &story.tags);
-                writeln!(
-                    out,
-                    "{}",
-                    style!("no transcript available for this video", dimmed)
-                )
-                .ok();
-                writeln!(out).ok();
-                writeln!(out, "url: {}", style!(story.url.as_str(), blue)).ok();
-                print_footer(&mut out, story);
-                return Err(e);
-            }
-        }
+        let transcript = fetch_youtube_transcript(&video_id).await?;
+        return Ok((
+            "youtube [transcript]".into(),
+            wrap_text(&transcript, opts.width),
+        ));
     }
 
+    // GitHub repos: try README first, fall back to HTML scraping
     if is_github_repo(&story.url) {
-        match fetch_github_readme(&story.url).await {
-            Ok(readme) => {
-                if json {
-                    print_article_json(&story.title, &story.url, "github", &readme);
-                    return Ok(());
-                }
-
-                print_header(&mut out, &story.title, "github", &story.tags);
-                let content = if opts.raw {
-                    readme
-                } else {
-                    render_markdown(&readme, opts.width)
-                };
-                print_content(&mut out, &content, opts.full);
-                print_footer(&mut out, story);
-                return Ok(());
-            }
-            Err(e) => {
-                if !json {
-                    writeln!(
-                        out,
-                        "{}",
-                        style!(format!("github readme: {e}").as_str(), yellow)
-                    )
-                    .ok();
-                }
-            }
+        if let Ok(readme) = fetch_github_readme(&story.url).await {
+            let content = if opts.raw {
+                readme
+            } else {
+                render_markdown(&readme, opts.width)
+            };
+            return Ok(("github".into(), content));
         }
+        // Fall through to HTML if README fetch fails
     }
 
-    let resp = CLIENT.get(&story.url).send().await?;
+    // Generic HTML
+    fetch_and_extract_html(story, opts).await
+}
 
+async fn fetch_and_extract_html(story: &StoryDetail, opts: &ReadOpts) -> Result<(String, String)> {
+    let resp = CLIENT.get(&story.url).send().await?;
     if !resp.status().is_success() {
         return Err(ReadError::Other(format!("http {}", resp.status())));
     }
@@ -454,34 +282,73 @@ pub async fn read_article(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
     }
 
     let html = resp.text().await?;
-
-    let (title, content) = match extract_with_llm_readability(&html, &story.url) {
-        Ok((t, c)) => (t, c),
-        Err(_) => match extract_with_selectors(&html, opts.width) {
-            Ok(c) => (None, c),
-            Err(e) => return Err(e),
-        },
+    let text = extract_with_llm_readability(&html, &story.url)?;
+    let source = extract_domain(&story.url).to_string();
+    let content = if opts.raw {
+        text
+    } else {
+        wrap_text(&text, opts.width)
     };
+    Ok((source, content))
+}
 
-    let display_title = title.as_deref().unwrap_or(&story.title);
-
-    if json {
-        print_article_json(display_title, &story.url, source, &content);
+fn render_self_post(story: &StoryDetail, opts: &ReadOpts) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Json) {
+        print_article_json(&story.title, "", "self", &story.description_plain);
         return Ok(());
     }
-
-    print_header(&mut out, display_title, source, &story.tags);
-
-    let final_content = if opts.raw {
-        content
+    let mut out = io::stdout().lock();
+    print_header(&mut out, &story.title, "self post", &story.tags);
+    if story.description_plain.is_empty() {
+        writeln!(out, "{}", style!("(no content - discussion post)", dimmed)).ok();
     } else {
-        wrap_text(&content, opts.width)
-    };
-
-    print_content(&mut out, &final_content, opts.full);
+        writeln!(out, "{}", wrap_text(&story.description_plain, opts.width)).ok();
+    }
     print_footer(&mut out, story);
-
     Ok(())
+}
+
+fn render_unsupported(story: &StoryDetail, content_type: &str, opts: &ReadOpts) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Json) {
+        print_article_json(
+            &story.title,
+            &story.url,
+            extract_domain(&story.url),
+            &format!("[unsupported: {content_type}]"),
+        );
+        return Ok(());
+    }
+    let mut out = io::stdout().lock();
+    print_header(
+        &mut out,
+        &story.title,
+        extract_domain(&story.url),
+        &story.tags,
+    );
+    writeln!(
+        out,
+        "{}",
+        style!(
+            format!("unsupported content type: {content_type}").as_str(),
+            red
+        )
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(out, "url: {}", style!(story.url.as_str(), blue)).ok();
+    print_footer(&mut out, story);
+    Err(ReadError::UnsupportedType(content_type.to_string()))
+}
+
+fn render_article(story: &StoryDetail, source: &str, content: &str, opts: &ReadOpts) {
+    if matches!(opts.format, OutputFormat::Json) {
+        print_article_json(&story.title, &story.url, source, content);
+        return;
+    }
+    let mut out = io::stdout().lock();
+    print_header(&mut out, &story.title, source, &story.tags);
+    print_content(&mut out, content, opts.full);
+    print_footer(&mut out, story);
 }
 
 fn print_article_json(title: &str, url: &str, source: &str, content: &str) {
