@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 pub struct Config {
     pub default_limit: Option<usize>,
     pub color: Option<bool>,
-    pub pager: Option<String>,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
@@ -17,6 +16,6 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-pub fn config_path() -> Option<PathBuf> {
+fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("lobstr").join("config.toml"))
 }
