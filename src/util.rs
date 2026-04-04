@@ -43,9 +43,10 @@ pub fn extract_domain(url: &str) -> &str {
 }
 
 pub fn print_json<T: Serialize + ?Sized>(data: &T) {
-    if let Ok(json) = serde_json::to_string_pretty(data) {
-        println!("{json}");
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(data).expect("serialization failed")
+    );
 }
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
