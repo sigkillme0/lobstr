@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+pub const DEFAULT_LIMIT: usize = 25;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -10,10 +12,25 @@ pub struct Config {
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    if !path.exists() {
+        return Config::default();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str(&contents) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("warning: failed to parse {}: {e}", path.display());
+                Config::default()
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: failed to read {}: {e}", path.display());
+            Config::default()
+        }
+    }
 });
 
 fn config_path() -> Option<PathBuf> {

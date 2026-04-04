@@ -346,7 +346,7 @@ pub struct ListOpts {
 impl Default for ListOpts {
     fn default() -> Self {
         Self {
-            limit: 25,
+            limit: crate::config::DEFAULT_LIMIT,
             page: 1,
             min_score: None,
             after: None,

@@ -99,7 +99,9 @@ fn parse_date(s: &str) -> Result<DateTime<FixedOffset>, String> {
 
 impl From<&ListArgs> for ListOpts {
     fn from(a: &ListArgs) -> Self {
-        let default_limit = config::CONFIG.default_limit.unwrap_or(25);
+        let default_limit = config::CONFIG
+            .default_limit
+            .unwrap_or(config::DEFAULT_LIMIT);
         Self {
             limit: a.limit.map_or(default_limit, NonZeroUsize::get),
             page: a.page.map_or(1, NonZeroU32::get),
@@ -294,7 +296,9 @@ async fn run(cli: &Cli) -> RunResult {
             limit,
             page,
         } => {
-            let default_limit = config::CONFIG.default_limit.unwrap_or(25);
+            let default_limit = config::CONFIG
+                .default_limit
+                .unwrap_or(config::DEFAULT_LIMIT);
             let search_opts = SearchOpts {
                 query: query.clone(),
                 what: *what,
