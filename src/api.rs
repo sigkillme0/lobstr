@@ -190,19 +190,19 @@ pub struct Story {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoryDetail {
-    pub short_id: String,
-    pub title: String,
-    #[serde(default)]
-    pub url: String,
-    pub score: i32,
-    pub comment_count: u32,
-    pub created_at: String,
-    pub submitter_user: String,
-    pub tags: Vec<String>,
+    #[serde(flatten)]
+    pub story: Story,
     #[serde(default)]
     pub description_plain: String,
     #[serde(default)]
     pub comments: Vec<Comment>,
+}
+
+impl std::ops::Deref for StoryDetail {
+    type Target = Story;
+    fn deref(&self) -> &Self::Target {
+        &self.story
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,14 +593,22 @@ pub async fn related(story: &StoryDetail, limit: usize) -> Result<Vec<Story>> {
     seen.insert(story.short_id.clone());
     let mut related = Vec::new();
 
+    let total = handles.len();
+    let mut failed = 0;
     for handle in handles {
-        if let Ok(Ok(stories)) = handle.await {
-            for s in stories {
-                if seen.insert(s.short_id.clone()) {
-                    related.push(s);
+        match handle.await {
+            Ok(Ok(stories)) => {
+                for s in stories {
+                    if seen.insert(s.short_id.clone()) {
+                        related.push(s);
+                    }
                 }
             }
+            _ => failed += 1,
         }
+    }
+    if failed == total && total > 0 {
+        eprintln!("warning: all related story fetches failed");
     }
 
     related.sort_unstable_by(|a, b| b.score.cmp(&a.score));
@@ -662,18 +670,6 @@ pub struct SearchOpts {
     pub order: SearchOrder,
     pub page: u32,
     pub limit: usize,
-}
-
-impl Default for SearchOpts {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            what: SearchWhat::Stories,
-            order: SearchOrder::Relevance,
-            page: 1,
-            limit: 25,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
