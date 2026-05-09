@@ -365,14 +365,14 @@ fn print_article_json(title: &str, url: &str, source: &str, content: &str) {
 }
 
 fn print_header<W: Write>(out: &mut W, title: &str, source: &str, tags: &[String]) {
-    let sep = "─".repeat(title.chars().count().min(78));
+    let sep = "-".repeat(title.chars().count().min(78));
 
     writeln!(out).ok();
     writeln!(out, "{}", style!(title, bold)).ok();
     writeln!(out, "{}", style!(sep.as_str(), dimmed)).ok();
     writeln!(
         out,
-        "{} │ {}",
+        "{} | {}",
         style!(source, blue),
         style!(tags.join(", ").as_str(), cyan)
     )
@@ -412,10 +412,10 @@ fn print_content<W: Write>(out: &mut W, content: &str, full: bool) {
 
 fn print_footer<W: Write>(out: &mut W, story: &StoryDetail) {
     writeln!(out).ok();
-    writeln!(out, "{}", style!("─".repeat(40).as_str(), dimmed)).ok();
+    writeln!(out, "{}", style!("-".repeat(40).as_str(), dimmed)).ok();
     writeln!(
         out,
-        "{} pts │ {} comments │ {}",
+        "{} pts | {} comments | {}",
         style!(story.score.to_string().as_str(), green),
         story.comment_count,
         style!(format!("lobste.rs/s/{}", story.short_id).as_str(), dimmed)
