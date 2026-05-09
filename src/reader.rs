@@ -1,5 +1,5 @@
 use crate::api::StoryDetail;
-use crate::util::{OutputFormat, extract_domain, print_json, style};
+use crate::util::{OutputFormat, extract_domain, html_to_text, print_json, style};
 use colored::Colorize;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
@@ -161,22 +161,26 @@ async fn fetch_youtube_transcript(video_id: &str) -> Result<String> {
     Ok(transcript.text())
 }
 
-fn extract_with_llm_readability(html: &str, url_str: &str) -> Result<String> {
+fn extract_with_llm_readability(html: &str, url_str: &str, width: usize) -> Result<String> {
     let url = url::Url::parse(url_str).map_err(|_| ReadError::Extract)?;
-    match llm_readability::extractor::extract(&mut html.as_bytes(), &url) {
-        Ok(product) => {
-            let content = if product.text.trim().is_empty() {
-                html2text::from_read(product.content.as_bytes(), 76).unwrap_or_default()
-            } else {
-                product.text
-            };
-            if content.trim().is_empty() {
-                Err(ReadError::Extract)
-            } else {
-                Ok(content)
-            }
-        }
-        Err(_) => Err(ReadError::Extract),
+    let product = llm_readability::extractor::extract(&mut html.as_bytes(), &url)
+        .map_err(|_| ReadError::Extract)?;
+
+    // Prefer html2text on the cleaned HTML — it preserves paragraph breaks and
+    // headings, both of which `product.text` flattens into a single hashbrown
+    // (its `extract_text` concatenates Text nodes with no separator). Fall back
+    // to the flat text only if html2text fails or returns nothing.
+    let from_html = html_to_text(product.content.as_bytes(), width);
+    let content = if from_html.trim().is_empty() {
+        product.text
+    } else {
+        from_html
+    };
+
+    if content.trim().is_empty() {
+        Err(ReadError::Extract)
+    } else {
+        Ok(content)
     }
 }
 
@@ -282,7 +286,7 @@ async fn fetch_and_extract_html(story: &StoryDetail, opts: &ReadOpts) -> Result<
     }
 
     let html = resp.text().await?;
-    let text = extract_with_llm_readability(&html, &story.url)?;
+    let text = extract_with_llm_readability(&html, &story.url, opts.width)?;
     let source = extract_domain(&story.url).to_string();
     let content = if opts.raw {
         text
