@@ -122,8 +122,10 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub enum Error {
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("'{0}' not found")]
+    #[error("not found: {0}")]
     NotFound(String),
+    #[error("invalid argument: {0}")]
+    Invalid(String),
     #[error("rate limited, try again later")]
     RateLimited,
     #[error("parse failed: {0}")]
@@ -132,8 +134,8 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-async fn get<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
-    let text = get_text(path).await?;
+async fn get<T: serde::de::DeserializeOwned>(path: &str, not_found: &str) -> Result<T> {
+    let text = get_text(path, not_found).await?;
     serde_json::from_str(&text).map_err(|e| {
         let preview: String = text.chars().take(200).collect();
         Error::ParseHtml(format!("{path}: {e} (body: {preview}...)"))
@@ -144,7 +146,7 @@ fn sel(s: &str) -> Result<Selector> {
     Selector::parse(s).map_err(|_| Error::ParseHtml(format!("invalid selector: {s}")))
 }
 
-async fn get_text(path: &str) -> Result<String> {
+async fn get_text(path: &str, not_found: &str) -> Result<String> {
     let url = format!("{BASE}{path}");
     let mut last_err = None;
 
@@ -157,7 +159,7 @@ async fn get_text(path: &str) -> Result<String> {
             Ok(resp) => {
                 return match resp.status() {
                     s if s == reqwest::StatusCode::NOT_FOUND => {
-                        Err(Error::NotFound(path.to_string()))
+                        Err(Error::NotFound(not_found.to_string()))
                     }
                     s if s == reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Error::RateLimited),
                     s if s.is_server_error() && attempt < MAX_RETRIES - 1 => {
@@ -174,7 +176,7 @@ async fn get_text(path: &str) -> Result<String> {
         }
     }
 
-    Err(last_err.unwrap_or_else(|| Error::NotFound(path.to_string())))
+    Err(last_err.unwrap_or_else(|| Error::NotFound(not_found.to_string())))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -399,35 +401,39 @@ fn filter_stories(stories: Vec<Story>, opts: &ListOpts) -> Vec<Story> {
 
 const MAX_PAGES_FETCH: u32 = 10;
 
-async fn fetch_stories<F>(opts: &ListOpts, make_path: F) -> Result<Vec<Story>>
+async fn fetch_stories<F>(opts: &ListOpts, make_path: F, label: &str) -> Result<Vec<Story>>
 where
     F: Fn(u32) -> String + Send + Sync,
 {
     if opts.after.is_some() || opts.before.is_some() {
-        return fetch_pages_filtered(opts, &make_path).await;
+        return fetch_pages_filtered(opts, &make_path, label).await;
     }
-    get::<Vec<Story>>(&make_path(opts.page))
+    get::<Vec<Story>>(&make_path(opts.page), label)
         .await
         .map(|v| filter_stories(v, opts))
 }
 
 pub async fn hottest(opts: &ListOpts) -> Result<Vec<Story>> {
-    fetch_stories(opts, |p| {
-        if p == 1 {
-            "/hottest.json".into()
-        } else {
-            format!("/page/{p}.json")
-        }
-    })
+    fetch_stories(
+        opts,
+        |p| {
+            if p == 1 {
+                "/hottest.json".into()
+            } else {
+                format!("/page/{p}.json")
+            }
+        },
+        "hottest stories",
+    )
     .await
 }
 
 pub async fn newest(opts: &ListOpts) -> Result<Vec<Story>> {
-    fetch_stories(opts, |p| format!("/newest/page/{p}.json")).await
+    fetch_stories(opts, |p| format!("/newest/page/{p}.json"), "newest stories").await
 }
 
 pub async fn active(opts: &ListOpts) -> Result<Vec<Story>> {
-    get::<Vec<Story>>("/active.json")
+    get::<Vec<Story>>("/active.json", "active stories")
         .await
         .map(|v| filter_stories(v, opts))
 }
@@ -435,12 +441,13 @@ pub async fn active(opts: &ListOpts) -> Result<Vec<Story>> {
 async fn fetch_pages_filtered(
     opts: &ListOpts,
     make_path: &(impl Fn(u32) -> String + Sync),
+    label: &str,
 ) -> Result<Vec<Story>> {
     let mut all = Vec::new();
     let mut page = opts.page;
 
     for _ in 0..MAX_PAGES_FETCH {
-        let stories: Vec<Story> = get(&make_path(page)).await?;
+        let stories: Vec<Story> = get(&make_path(page), label).await?;
         if stories.is_empty() {
             break;
         }
@@ -477,7 +484,7 @@ pub async fn by_tag(
 ) -> Result<Vec<Story>> {
     let tags = parse_csv(tags_input);
     if tags.is_empty() {
-        return Err(Error::NotFound("no tags specified".into()));
+        return Err(Error::Invalid("no tags specified".into()));
     }
 
     let exclude_tags = exclude.map(parse_csv).unwrap_or_default();
@@ -487,53 +494,58 @@ pub async fn by_tag(
         p => format!("/t/{primary}/page/{p}.json"),
     };
 
-    get::<Vec<Story>>(&path).await.map(|stories| {
-        let filtered = stories
-            .into_iter()
-            .filter(|s| {
-                if exclude_tags.iter().any(|t| tags_match(&s.tags, t)) {
-                    return false;
-                }
-                if tags.len() == 1 {
-                    return true;
-                }
-                let check = |t: &&str| tags_match(&s.tags, t);
-                match mode {
-                    TagMode::All => tags.iter().all(check),
-                    TagMode::Any => tags.iter().any(check),
-                }
-            })
-            .collect();
-        filter_stories(filtered, opts)
-    })
+    get::<Vec<Story>>(&path, &format!("tag '{primary}'"))
+        .await
+        .map(|stories| {
+            let filtered = stories
+                .into_iter()
+                .filter(|s| {
+                    if exclude_tags.iter().any(|t| tags_match(&s.tags, t)) {
+                        return false;
+                    }
+                    if tags.len() == 1 {
+                        return true;
+                    }
+                    let check = |t: &&str| tags_match(&s.tags, t);
+                    match mode {
+                        TagMode::All => tags.iter().all(check),
+                        TagMode::Any => tags.iter().any(check),
+                    }
+                })
+                .collect();
+            filter_stories(filtered, opts)
+        })
 }
 
 pub async fn story(id: &str) -> Result<StoryDetail> {
     if !valid_story_id(id) {
-        return Err(Error::NotFound(format!("invalid story id: {id}")));
+        return Err(Error::Invalid(format!("story id '{id}'")));
     }
-    get(&format!("/s/{id}.json")).await
+    get(&format!("/s/{id}.json"), &format!("story '{id}'")).await
 }
 
 pub async fn user(name: &str) -> Result<User> {
     if !valid_username(name) {
-        return Err(Error::NotFound(format!("invalid username: {name}")));
+        return Err(Error::Invalid(format!("username '{name}'")));
     }
-    get(&format!("/~{name}.json")).await
+    get(&format!("/~{name}.json"), &format!("user '{name}'")).await
 }
 
 pub async fn user_stats(name: &str) -> Result<UserStats> {
     if !valid_username(name) {
-        return Err(Error::NotFound(format!("invalid username: {name}")));
+        return Err(Error::Invalid(format!("username '{name}'")));
     }
 
     let profile_path = format!("/~{name}");
+    let label = format!("user '{name}'");
     let karma_opts = ListOpts {
         limit: 100,
         ..Default::default()
     };
-    let (html_result, karma_result) =
-        tokio::join!(get_text(&profile_path), user_stories(name, &karma_opts));
+    let (html_result, karma_result) = tokio::join!(
+        get_text(&profile_path, &label),
+        user_stories(name, &karma_opts)
+    );
 
     let html = html_result?;
     let doc = Html::parse_document(&html);
@@ -570,7 +582,7 @@ pub async fn user_stats(name: &str) -> Result<UserStats> {
 }
 
 pub async fn tags() -> Result<Vec<Tag>> {
-    get::<Vec<Tag>>("/tags.json").await.map(|mut v| {
+    get::<Vec<Tag>>("/tags.json", "tags").await.map(|mut v| {
         v.retain(|t| t.active);
         v.sort_unstable_by(|a, b| a.tag.cmp(&b.tag));
         v
@@ -587,7 +599,8 @@ pub async fn related(story: &StoryDetail, limit: usize) -> Result<Vec<Story>> {
         .iter()
         .map(|tag| {
             let path = format!("/t/{tag}.json");
-            tokio::spawn(async move { get::<Vec<Story>>(&path).await })
+            let label = format!("tag '{tag}'");
+            tokio::spawn(async move { get::<Vec<Story>>(&path, &label).await })
         })
         .collect();
 
@@ -620,15 +633,20 @@ pub async fn related(story: &StoryDetail, limit: usize) -> Result<Vec<Story>> {
 
 pub async fn user_stories(name: &str, opts: &ListOpts) -> Result<Vec<Story>> {
     if !valid_username(name) {
-        return Err(Error::NotFound(format!("invalid username: {name}")));
+        return Err(Error::Invalid(format!("username '{name}'")));
     }
-    fetch_stories(opts, |p| {
-        if p == 1 {
-            format!("/~{name}/stories.json")
-        } else {
-            format!("/~{name}/stories/page/{p}.json")
-        }
-    })
+    let label = format!("user '{name}'");
+    fetch_stories(
+        opts,
+        |p| {
+            if p == 1 {
+                format!("/~{name}/stories.json")
+            } else {
+                format!("/~{name}/stories/page/{p}.json")
+            }
+        },
+        &label,
+    )
     .await
 }
 
@@ -692,7 +710,7 @@ impl SearchResult {
 
 pub async fn user_comments(name: &str, opts: &ListOpts) -> Result<Vec<UserComment>> {
     if !valid_username(name) {
-        return Err(Error::NotFound(format!("invalid username: {name}")));
+        return Err(Error::Invalid(format!("username '{name}'")));
     }
 
     let path = match opts.page {
@@ -700,7 +718,7 @@ pub async fn user_comments(name: &str, opts: &ListOpts) -> Result<Vec<UserCommen
         p => format!("/search?q=commenter%3A{name}&what=comments&order=newest&page={p}"),
     };
 
-    let html = get_text(&path).await?;
+    let html = get_text(&path, &format!("user '{name}'")).await?;
     let doc = Html::parse_document(&html);
 
     let comment_sel = sel("div.comment")?;
@@ -767,7 +785,7 @@ fn url_encode(s: &str) -> String {
 
 pub async fn search(opts: &SearchOpts) -> Result<SearchResult> {
     if opts.query.trim().is_empty() {
-        return Err(Error::NotFound("empty search query".into()));
+        return Err(Error::Invalid("empty search query".into()));
     }
 
     match opts.what {
@@ -786,7 +804,7 @@ async fn search_stories(opts: &SearchOpts) -> Result<Vec<SearchStory>> {
         ),
     };
 
-    let html = get_text(&path).await?;
+    let html = get_text(&path, "search results").await?;
     let doc = Html::parse_document(&html);
 
     let story_sel = sel("li.story")?;
@@ -896,7 +914,7 @@ async fn search_comments(opts: &SearchOpts) -> Result<Vec<SearchComment>> {
         ),
     };
 
-    let html = get_text(&path).await?;
+    let html = get_text(&path, "search results").await?;
     let doc = Html::parse_document(&html);
 
     let comment_sel = sel("div.comment")?;
