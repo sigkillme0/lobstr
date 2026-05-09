@@ -2,13 +2,12 @@ use crate::api::{
     Comment, SearchComment, SearchResult, SearchStory, Story, StoryDetail, Tag, User, UserComment,
     UserStats,
 };
-use crate::util::{OutputFormat, extract_domain, print_json, style};
+use crate::util::{OutputFormat, WRAP_WIDTH, extract_domain, html_to_text, print_json, style};
 use colored::{ColoredString, Colorize};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-const WRAP_WIDTH: usize = 76;
 const COMMENT_PREVIEW_LINES: usize = 12;
 
 fn score_color(score: i32, text: &str) -> ColoredString {
@@ -207,8 +206,7 @@ fn print_comment<W: Write>(out: &mut W, c: &Comment, full: bool) {
     .ok();
 
     let prefix_len = indent.len() + bar.len() + 2;
-    let text = html2text::from_read(c.comment.as_bytes(), WRAP_WIDTH.saturating_sub(prefix_len))
-        .unwrap_or_default();
+    let text = html_to_text(c.comment.as_bytes(), WRAP_WIDTH.saturating_sub(prefix_len));
 
     let max = if full {
         usize::MAX
@@ -297,12 +295,7 @@ pub fn user(u: &User, stats: Option<&UserStats>, opts: &DisplayOpts) {
 
     if !u.about.is_empty() {
         writeln!(out).ok();
-        write!(
-            out,
-            "{}",
-            html2text::from_read(u.about.as_bytes(), WRAP_WIDTH).unwrap_or_default()
-        )
-        .ok();
+        write!(out, "{}", html_to_text(u.about.as_bytes(), WRAP_WIDTH)).ok();
     }
 }
 

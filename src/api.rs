@@ -8,6 +8,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
 
+use crate::util::{WRAP_WIDTH, html_to_text};
+
 #[derive(Debug, Clone, Copy, Default)]
 pub enum TagMode {
     #[default]
@@ -735,7 +737,7 @@ pub async fn user_comments(name: &str, opts: &ListOpts) -> Result<Vec<UserCommen
         let comment_text = el
             .select(&body_sel)
             .next()
-            .and_then(|b| html2text::from_read(b.inner_html().as_bytes(), 76).ok())
+            .map(|b| html_to_text(b.inner_html().as_bytes(), WRAP_WIDTH))
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -955,7 +957,7 @@ async fn search_comments(opts: &SearchOpts) -> Result<Vec<SearchComment>> {
         let comment_text = el
             .select(&text_sel)
             .next()
-            .and_then(|b| html2text::from_read(b.inner_html().as_bytes(), 76).ok())
+            .map(|b| html_to_text(b.inner_html().as_bytes(), WRAP_WIDTH))
             .unwrap_or_default()
             .trim()
             .to_string();
