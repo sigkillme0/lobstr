@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 const COMMENT_PREVIEW_LINES: usize = 12;
+const SHORT_COMMENT_PREVIEW_LINES: usize = 6;
 
 fn score_color(score: i32, text: &str) -> ColoredString {
     match score {
@@ -25,6 +26,30 @@ fn comment_score_color(score: i32) -> ColoredString {
         n if n >= 10 => style!(text.as_str(), green),
         n if n < 0 => style!(text.as_str(), red),
         _ => style!(text.as_str(), dimmed),
+    }
+}
+
+/// Write `text` line-by-line with `prefix` in front of each line, capped at
+/// `default_cap` lines unless `full` is true. If lines were elided, append a
+/// dimmed `[... N more lines, use --full to show all]` marker so the consumer
+/// (human or LLM) knows truncation happened and how to defeat it.
+fn write_truncated_lines<W: Write>(
+    out: &mut W,
+    text: &str,
+    default_cap: usize,
+    full: bool,
+    prefix: &str,
+) {
+    let max = if full { usize::MAX } else { default_cap };
+    let lines: Vec<_> = text.trim().lines().collect();
+    for line in lines.iter().take(max) {
+        writeln!(out, "{prefix}{line}").ok();
+    }
+    if lines.len() > max {
+        let omitted = lines.len() - max;
+        let unit = if omitted == 1 { "line" } else { "lines" };
+        let marker = format!("[... {omitted} more {unit}, use --full to show all]");
+        writeln!(out, "{prefix}{}", style!(marker.as_str(), dimmed)).ok();
     }
 }
 
@@ -205,22 +230,12 @@ fn print_comment<W: Write>(out: &mut W, c: &Comment, full: bool) {
     )
     .ok();
 
-    let prefix_len = indent.len() + bar.len() + 2;
-    let text = html_to_text(c.comment.as_bytes(), WRAP_WIDTH.saturating_sub(prefix_len));
-
-    let max = if full {
-        usize::MAX
-    } else {
-        COMMENT_PREVIEW_LINES
-    };
-    let lines: Vec<_> = text.trim().lines().collect();
-
-    for line in lines.iter().take(max) {
-        writeln!(out, "{indent}{bar}  {line}").ok();
-    }
-    if lines.len() > max {
-        writeln!(out, "{indent}{bar}  {}", style!("[...]", dimmed)).ok();
-    }
+    let line_prefix = format!("{indent}{bar}  ");
+    let text = html_to_text(
+        c.comment.as_bytes(),
+        WRAP_WIDTH.saturating_sub(line_prefix.len()),
+    );
+    write_truncated_lines(out, &text, COMMENT_PREVIEW_LINES, full, &line_prefix);
     writeln!(out).ok();
 }
 
@@ -375,7 +390,7 @@ pub fn tags(items: &[Tag], opts: &DisplayOpts, filter: Option<&str>) {
     }
 }
 
-pub fn user_comments(items: &[UserComment], opts: &DisplayOpts, page: u32) {
+pub fn user_comments(items: &[UserComment], opts: &DisplayOpts, page: u32, full: bool) {
     match opts.format {
         OutputFormat::Json => return print_json(items),
         OutputFormat::Tsv => {
@@ -407,13 +422,13 @@ pub fn user_comments(items: &[UserComment], opts: &DisplayOpts, page: u32) {
         )
         .ok();
 
-        let lines: Vec<_> = c.comment_text.lines().collect();
-        for line in lines.iter().take(6) {
-            writeln!(out, "  {line}").ok();
-        }
-        if lines.len() > 6 {
-            writeln!(out, "  {}", style!("[...]", dimmed)).ok();
-        }
+        write_truncated_lines(
+            &mut out,
+            &c.comment_text,
+            SHORT_COMMENT_PREVIEW_LINES,
+            full,
+            "  ",
+        );
         writeln!(out).ok();
     }
 
@@ -422,10 +437,10 @@ pub fn user_comments(items: &[UserComment], opts: &DisplayOpts, page: u32) {
     }
 }
 
-pub fn search_results(result: &SearchResult, opts: &DisplayOpts, page: u32) {
+pub fn search_results(result: &SearchResult, opts: &DisplayOpts, page: u32, full: bool) {
     match result {
         SearchResult::Stories(stories) => search_stories(stories, opts, page),
-        SearchResult::Comments(comments) => search_comments(comments, opts, page),
+        SearchResult::Comments(comments) => search_comments(comments, opts, page, full),
     }
 }
 
@@ -492,7 +507,7 @@ fn search_stories(items: &[SearchStory], opts: &DisplayOpts, page: u32) {
     }
 }
 
-fn search_comments(items: &[SearchComment], opts: &DisplayOpts, page: u32) {
+fn search_comments(items: &[SearchComment], opts: &DisplayOpts, page: u32, full: bool) {
     match opts.format {
         OutputFormat::Json => return print_json(items),
         OutputFormat::Ids => {
@@ -532,13 +547,13 @@ fn search_comments(items: &[SearchComment], opts: &DisplayOpts, page: u32) {
         )
         .ok();
 
-        let lines: Vec<_> = c.comment_text.lines().collect();
-        for line in lines.iter().take(6) {
-            writeln!(out, "  {line}").ok();
-        }
-        if lines.len() > 6 {
-            writeln!(out, "  {}", style!("[...]", dimmed)).ok();
-        }
+        write_truncated_lines(
+            &mut out,
+            &c.comment_text,
+            SHORT_COMMENT_PREVIEW_LINES,
+            full,
+            "  ",
+        );
         writeln!(out).ok();
     }
 

@@ -158,6 +158,9 @@ enum Cmd {
         /// page number [default: 1]
         #[arg(short, long)]
         page: Option<NonZeroU32>,
+        /// show full comment bodies without truncation (only affects -w comments)
+        #[arg(short, long)]
+        full: bool,
     },
     /// view story with comments
     View {
@@ -216,6 +219,9 @@ enum UserAction {
     /// show user's comments
     Comments {
         name: String,
+        /// show full comment bodies without truncation
+        #[arg(short, long)]
+        full: bool,
         #[command(flatten)]
         args: ListArgs,
     },
@@ -292,6 +298,7 @@ async fn run(cli: &Cli) -> RunResult {
             order,
             limit,
             page,
+            full,
         } => {
             let default_limit = config::CONFIG
                 .default_limit
@@ -306,7 +313,7 @@ async fn run(cli: &Cli) -> RunResult {
             match api::search(&search_opts).await {
                 Ok(result) if result.is_empty() => RunResult::Empty,
                 Ok(result) => {
-                    display::search_results(&result, &opts, page.map_or(1, NonZeroU32::get));
+                    display::search_results(&result, &opts, page.map_or(1, NonZeroU32::get), *full);
                     RunResult::Ok
                 }
                 Err(e) => RunResult::Err(e),
@@ -351,10 +358,10 @@ async fn run(cli: &Cli) -> RunResult {
                     display::stories(v, &opts, p);
                 })
             }
-            UserAction::Comments { name, args } => {
+            UserAction::Comments { name, full, args } => {
                 let p = args.page.map_or(1, NonZeroU32::get);
                 fetch_and_show(api::user_comments(name, &args.into()).await, |v| {
-                    display::user_comments(v, &opts, p);
+                    display::user_comments(v, &opts, p, *full);
                 })
             }
         },
